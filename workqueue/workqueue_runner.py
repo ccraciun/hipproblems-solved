@@ -76,14 +76,14 @@ if __name__ == '__main__':
         help='time to wait for a result (in seconds)',
         default=5)
     parser.add_argument(
-        '--loglevel', type=int, help='loglevel to use', default=20)
+        '--loglevel', type=str, help='loglevel to use', default='INFO')
     parser.add_argument(
         '--host', help='Redis hostname', default='localhost')
     parser.add_argument(
         '--port', help='Redis port', type=int, default=6379)
     args = parser.parse_args()
 
-    logging.basicConfig()
+    logging.basicConfig(format='%(asctime)-15s %(name)-12s: %(levelname)-8s %(message)s')
     LOG.setLevel(args.loglevel)
 
     REDIS = redis.StrictRedis(host=args.host, port=args.port, db=0)
@@ -99,6 +99,7 @@ if __name__ == '__main__':
     # Enqueue the work items
     job_id = random.randint(1, 100)
     expected_result = 0
+    LOG.info('Starting enqueueing')
     for _ in range(args.num_work_items):
         value = random.randint(1, 1000)
         w = {
@@ -109,10 +110,17 @@ if __name__ == '__main__':
         expected_result += value
         REDIS.lpush(WORK_QUEUE, json.dumps(w))
         LOG.debug("Enqueued work item: %r", w)
+    LOG.info('Done enqueueing')
 
     # Spawn workers, and wait for them to finish
+    LOG.info('Starting workers')
     workers = [gevent.spawn(worker, n) for n in range(args.num_workers)]
+    LOG.info('Waiting for  workers')
+    while(REDIS.llen(WORK_QUEUE) > 0):
+        gevent.sleep(0.1)
+    LOG.info('Work queue drained')
     gevent.joinall(workers, timeout=args.timeout)
+    LOG.info('Collected all workers')
 
     # Verify the result
     res = REDIS.hget(RESULT_HASH, job_id)
