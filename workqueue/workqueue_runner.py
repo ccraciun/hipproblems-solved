@@ -19,10 +19,6 @@
 # corresponding job_id.
 
 
-# Note!
-# The given implementation works fine for a single worker, but something isn't
-# quite right when I add more workers. Maybe you can help me figure that out?
-
 from gevent import monkey
 monkey.patch_all()
 
@@ -50,14 +46,11 @@ def worker(worker_id):
     Pulls work items from the queue, and adds their values to the result hash
     """
     while True:
-        # pull the first work item
-        work_raw = REDIS.lindex(WORK_QUEUE, 0)
+        # pull the first work item atomically
+        work_raw = REDIS.lpop(WORK_QUEUE)
         if not work_raw:
             # no more work to do, so we're done
             return
-
-        # delete it from the queue
-        REDIS.lrem(WORK_QUEUE, 0, work_raw)
 
         # de-jsonify the work, and update the result hash
         work = json.loads(work_raw)
