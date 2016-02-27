@@ -22,21 +22,28 @@
 from gevent import monkey
 monkey.patch_all()
 
+import argparse
+import collections
 import gevent
 import json
 import logging
-import argparse
 import random
 import redis
+import sets
 
 
 def make_redis_key(key):
     return 'hipmunk:%s' % key
 
+
 WORK_QUEUE = make_redis_key('queue')
 RESULT_HASH = make_redis_key('result')
 LOG = logging.getLogger(__name__)
 REDIS = None
+
+BATCH_SIZE = 20
+
+aborted_transactions = [0]
 
 
 def worker(worker_id):
@@ -46,16 +53,28 @@ def worker(worker_id):
     Pulls work items from the queue, and adds their values to the result hash
     """
     while True:
-        # pull the first work item atomically
-        work_raw = REDIS.lpop(WORK_QUEUE)
-        if not work_raw:
-            # no more work to do, so we're done
-            return
+        with REDIS.pipeline() as pipe:
+            try:
+                pipe.watch(WORK_QUEUE)
+                work_raw = pipe.zrange(WORK_QUEUE, 0, BATCH_SIZE)
+                if not work_raw:
+                    return
 
-        # de-jsonify the work, and update the result hash
-        work = json.loads(work_raw)
-        LOG.debug('Got work! worker_id: %d, work: %r', worker_id, work)
-        REDIS.hincrby(RESULT_HASH, work['job_id'], work['value'])
+                LOG.debug('Got raw work! worker_id: %d,  work: %r', worker_id, work_raw)
+                batch_result = collections.defaultdict(int)
+                for item_raw in work_raw:
+                    work = json.loads(item_raw)
+                    batch_result[work['job_id']] += work['value']
+                LOG.debug('Work results: %r', batch_result)
+
+                pipe.multi()
+                pipe.zrem(WORK_QUEUE, *work_raw)
+                for job_id, value in batch_result.items():
+                    pipe.hincrby(RESULT_HASH, job_id, value)
+                pipe.execute()
+            except redis.exceptions.WatchError:
+                aborted_transactions[0] += 1
+                continue
 
 
 if __name__ == '__main__':
@@ -98,34 +117,38 @@ if __name__ == '__main__':
 
     # Enqueue the work items
     job_id = random.randint(1, 100)
+    unique_values = sets.Set()
     expected_result = 0
     LOG.info('Starting enqueueing')
     for _ in range(args.num_work_items):
-        value = random.randint(1, 1000)
+        value = random.randint(1, 1000000)
         w = {
             'job_id': job_id,
             'attempt_nr': 1,
             'value': value,
         }
-        expected_result += value
-        REDIS.lpush(WORK_QUEUE, json.dumps(w))
-        LOG.debug("Enqueued work item: %r", w)
+        score = random.random()
+        if value not in unique_values:
+            expected_result += value
+            unique_values.add(value)
+        LOG.debug("Enqueued with score %f work item: %r", score, w)
+        REDIS.zadd(WORK_QUEUE, score, json.dumps(w))
     LOG.info('Done enqueueing')
 
     # Spawn workers, and wait for them to finish
     LOG.info('Starting workers')
     workers = [gevent.spawn(worker, n) for n in range(args.num_workers)]
-    LOG.info('Waiting for  workers')
-    while(REDIS.llen(WORK_QUEUE) > 0):
+    LOG.info('Waiting for work queue to drain.')
+    while(REDIS.zcard(WORK_QUEUE) > 0):
         gevent.sleep(0.1)
-    LOG.info('Work queue drained')
+    LOG.info('Work queue drained. Collecting workers.')
     gevent.joinall(workers, timeout=args.timeout)
-    LOG.info('Collected all workers')
+    LOG.info('Collected all workers.')
 
     # Verify the result
     res = REDIS.hget(RESULT_HASH, job_id)
     if res is None:
-        LOG.error("Unable to find the result in Redis")
+        LOG.error('Unable to find the result in Redis.')
         exit(1)
 
     # Compare result to the expected value
@@ -139,3 +162,4 @@ if __name__ == '__main__':
             res,
             expected_result
         )
+    LOG.info('Aborted redis transactions: %d', aborted_transactions[0])
